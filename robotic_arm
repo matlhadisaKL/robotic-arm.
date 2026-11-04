@@ -1,1 +1,132 @@
+/*
+  Robot Arm Controller
+  Board:   Elegoo Uno R3 (select "Arduino Uno" in the IDE)
+  Driver:  PCA9685 16-channel PWM servo board (I2C address 0x40)
+  Servos:  ch0 Base (MG996R), ch1 Shoulder (MG996R), ch2 Elbow (SG90/MG90S), ch3 Gripper (SG90/MG90S)
+  Control: 2x dual-axis analog joysticks
+
+  Joystick 1: X -> Base,    Y -> Shoulder, press -> move to HOME position
+  Joystick 2: Y -> Elbow,   X -> Gripper,  press -> print current angles to Serial (115200 baud)
+
+  The sticks control SPEED, not position: push to move, let go and the joint holds still.
+
+  Library needed: "Adafruit PWM Servo Driver Library" (Arduino IDE > Tools > Manage Libraries)
+*/
+
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
+
+// ---------------- Joint configuration (tune these for your build) ----------------
+const uint8_t NUM_JOINTS = 4;
+const char*   NAMES[NUM_JOINTS]      = {"Base", "Shoulder", "Elbow", "Gripper"};
+const uint8_t CHANNEL[NUM_JOINTS]    = {0, 1, 2, 3};          // PCA9685 output channel
+const uint8_t JOY_PIN[NUM_JOINTS]    = {A0, A1, A3, A2};      // J1-X, J1-Y, J2-Y, J2-X
+const bool    INVERT[NUM_JOINTS]     = {false, false, false, false}; // flip if a joint moves the wrong way
+const int     MIN_ANGLE[NUM_JOINTS]  = {0,   15,  15,  30};   // soft limits: keep the arm from hitting itself
+const int     MAX_ANGLE[NUM_JOINTS]  = {180, 165, 165, 110};
+const int     HOME_ANGLE[NUM_JOINTS] = {90,  90,  90,  70};
+const float   MAX_SPEED[NUM_JOINTS]  = {90,  60,  60,  120};  // degrees per second at full stick
+
+// ---------------- Hardware constants ----------------
+const int     SERVO_MIN_US = 500;    // pulse width at 0 degrees
+const int     SERVO_MAX_US = 2500;   // pulse width at 180 degrees
+const int     DEADZONE     = 60;     // ignore small stick wobble around center (0-512)
+const float   HOME_SPEED   = 60;     // degrees per second when returning home
+const uint8_t HOME_BTN     = 2;      // Joystick 1 SW
+const uint8_t PRINT_BTN    = 3;      // Joystick 2 SW
+const uint16_t LOOP_MS     = 20;     // 50 updates per second
+
+// ---------------- State ----------------
+float angle[NUM_JOINTS];
+int   center[NUM_JOINTS];
+bool  homing = false;
+bool  lastPrintBtn = HIGH;
+unsigned long lastMs = 0;
+
+void writeServo(uint8_t j) {
+  int us = map((long)(angle[j] * 10), 0, 1800, SERVO_MIN_US, SERVO_MAX_US);
+  pwm.writeMicroseconds(CHANNEL[j], us);
+}
+
+// Average a few readings while the sticks are untouched, so off-center joysticks don't drift.
+void calibrateSticks() {
+  for (uint8_t j = 0; j < NUM_JOINTS; j++) {
+    long sum = 0;
+    for (uint8_t i = 0; i < 16; i++) { sum += analogRead(JOY_PIN[j]); delay(2); }
+    center[j] = sum / 16;
+  }
+}
+
+// Returns stick deflection from -1.0 to 1.0, with the deadzone removed.
+float readStick(uint8_t j) {
+  int raw = analogRead(JOY_PIN[j]) - center[j];
+  if (abs(raw) < DEADZONE) return 0;
+  float v = (raw > 0 ? raw - DEADZONE : raw + DEADZONE) / float(512 - DEADZONE);
+  v = constrain(v, -1.0, 1.0);
+  return INVERT[j] ? -v : v;
+}
+
+void printAngles() {
+  for (uint8_t j = 0; j < NUM_JOINTS; j++) {
+    Serial.print(NAMES[j]); Serial.print(": "); Serial.print(angle[j], 0);
+    Serial.print(j < NUM_JOINTS - 1 ? "  |  " : "\n");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(HOME_BTN, INPUT_PULLUP);
+  pinMode(PRINT_BTN, INPUT_PULLUP);
+
+  pwm.begin();
+  pwm.setOscillatorFrequency(27000000);
+  pwm.setPWMFreq(50);               // standard analog servo frequency
+  delay(10);
+
+  // Keep the sticks centered while the board starts up.
+  calibrateSticks();
+
+  for (uint8_t j = 0; j < NUM_JOINTS; j++) {
+    angle[j] = HOME_ANGLE[j];
+    writeServo(j);
+    delay(300);                     // start servos one at a time to avoid a current spike
+  }
+
+  Serial.println("Robot arm ready. J1 press = home, J2 press = print angles.");
+  lastMs = millis();
+}
+
+void loop() {
+  unsigned long now = millis();
+  if (now - lastMs < LOOP_MS) return;
+  float dt = (now - lastMs) / 1000.0;
+  lastMs = now;
+
+  if (digitalRead(HOME_BTN) == LOW) homing = true;
+
+  bool printBtn = digitalRead(PRINT_BTN);
+  if (printBtn == LOW && lastPrintBtn == HIGH) printAngles();
+  lastPrintBtn = printBtn;
+
+  bool allHome = true;
+  for (uint8_t j = 0; j < NUM_JOINTS; j++) {
+    float v = readStick(j);
+    if (v != 0) homing = false;     // touching a stick cancels homing
+
+    if (homing) {
+      float diff = HOME_ANGLE[j] - angle[j];
+      float step = HOME_SPEED * dt;
+      if (abs(diff) <= step) angle[j] = HOME_ANGLE[j];
+      else { angle[j] += (diff > 0 ? step : -step); allHome = false; }
+    } else {
+      angle[j] += v * MAX_SPEED[j] * dt;
+    }
+
+    angle[j] = constrain(angle[j], MIN_ANGLE[j], MAX_ANGLE[j]);
+    writeServo(j);
+  }
+  if (homing && allHome) homing = false;
+}
 
